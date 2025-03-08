@@ -1,0 +1,16 @@
+[package]
+name = "harvard-lines"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+soundkit-opus = { git = "ssh://git@github.com/wavey-ai/soundkit.git" }
+soundkit = { git = "ssh://git@github.com/wavey-ai/soundkit.git" }
+regex = "1.11.1"
+rubato = "0.16.1"
+frame-header = "0.2.0"
+ndarray = "0.16.1"
+#mel_spec = "0.3.1"
+
+mel_spec = { path = "../mel_spec/" }
+image = "0.25.5"

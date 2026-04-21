@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "mel_spec"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "image 0.24.9",
  "ndarray",

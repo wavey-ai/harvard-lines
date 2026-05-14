@@ -1,9 +1,8 @@
 use frame_header::{EncodingFlag, Endianness, FrameHeader};
-use image::ImageBuffer;
 use mel_spec::mel::MelSpectrogram;
 use mel_spec::stft::Spectrogram;
 use mel_spec::vad::{DetectionSettings, VoiceActivityDetector, as_image, vad_boundaries};
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use regex::Regex;
 use rubato::Resampler;
 use soundkit::audio_bytes::{f32le_to_i16, s24le_to_i16};
@@ -11,10 +10,9 @@ use soundkit::audio_packet::Encoder;
 use soundkit::wav::WavStreamProcessor;
 use soundkit_opus::OpusEncoder;
 use std::cmp;
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct LineAudio {
@@ -360,6 +358,71 @@ impl AudioProcessor {
         Ok((file_audio_clips, file_pcm_clips, clip_count))
     }
 
+    fn run_segmentation_vad_pcm(
+        &self,
+        resampled_samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<Vec<i16>>, Box<dyn std::error::Error>> {
+        let hop_size = 160;
+        let mel_frames = self.compute_mel_frames(resampled_samples, sample_rate);
+        let default_settings = DetectionSettings::new(1.0, 10, 10, 0);
+        let mut vad = VoiceActivityDetector::new(&default_settings);
+        let mut decisions = Vec::new();
+        for frame in &mel_frames {
+            decisions.push(vad.add(&frame.to_owned()).unwrap_or(false));
+        }
+
+        let total_samples = resampled_samples.len();
+        let min_length = self.output_sample_rate as usize;
+        let mut best_candidate = None;
+        let mut best_diff = usize::MAX;
+        let mut chosen_threshold = 0;
+        for candidate in (5..=30).rev() {
+            let mut segments =
+                self.compute_segments(&decisions, candidate, hop_size, total_samples);
+            if !segments.is_empty() && self.has_intro {
+                segments.remove(0);
+            }
+            segments.retain(|&(start, end)| (end - start) >= min_length);
+            let seg_count = segments.len();
+            println!(
+                "Candidate threshold {}: produced {} segments",
+                candidate, seg_count
+            );
+            if seg_count == self.lines_in_file {
+                best_candidate = Some(segments);
+                chosen_threshold = candidate;
+                println!("Exact match found with threshold {}", candidate);
+                break;
+            } else {
+                let diff = seg_count.abs_diff(self.lines_in_file);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_candidate = Some(segments);
+                    chosen_threshold = candidate;
+                }
+            }
+        }
+        let final_segments = best_candidate.ok_or("No segments found")?;
+        println!("Chosen contiguous threshold: {}", chosen_threshold);
+
+        let pre_vad_padding_samples =
+            (self.pre_vad_padding_ms as usize * self.output_sample_rate as usize) / 1000;
+        let mut file_pcm_clips = Vec::new();
+        for (start, end) in final_segments {
+            let start = start.saturating_sub(pre_vad_padding_samples);
+            let clip_samples = &resampled_samples[start..end];
+            let clip_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    clip_samples.as_ptr() as *const u8,
+                    clip_samples.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            file_pcm_clips.push(f32le_to_i16(clip_bytes));
+        }
+        Ok(file_pcm_clips)
+    }
+
     /// Process each WAV file: preprocess, compute mel frames, save a VAD image,
     /// run segmentation with iterative contiguous thresholds until the desired number of segments is reached,
     /// encode segments to Opus, and write the PCM/Opus files using sentence names from the Harvard file.
@@ -449,6 +512,80 @@ impl AudioProcessor {
         }
         Ok(line_audio_entries)
     }
+
+    pub fn process_pcm_numbered(
+        &self,
+        text_file: &str,
+        src_dir: &str,
+        output_dir: &str,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let sentences = Self::read_harvard_file_lines(text_file)?;
+        let mut file_paths: Vec<PathBuf> = fs::read_dir(src_dir)?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("wav") {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        file_paths.sort();
+
+        fs::create_dir_all(output_dir)?;
+
+        let mut sentence_index = 0;
+        for path in file_paths.iter() {
+            let resampled_samples = self.preprocess_file(path)?;
+            let file_pcm_clips =
+                self.run_segmentation_vad_pcm(&resampled_samples, self.output_sample_rate)?;
+            println!(
+                "VAD segmentation for file {:?} produced {} clips",
+                path,
+                file_pcm_clips.len()
+            );
+
+            for pcm in file_pcm_clips {
+                let sentence = sentences
+                    .get(sentence_index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("clip_{}", sentence_index + 1));
+                let filename = format!(
+                    "{:03}_{}.pcm",
+                    sentence_index + 1,
+                    sanitize_filename_part(&sentence)
+                );
+                let pcm_file_path = Path::new(output_dir).join(filename);
+                let pcm_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        pcm.as_ptr() as *const u8,
+                        pcm.len() * std::mem::size_of::<i16>(),
+                    )
+                };
+                fs::write(&pcm_file_path, pcm_bytes)?;
+                println!("Wrote PCM data to {}", pcm_file_path.display());
+                sentence_index += 1;
+            }
+        }
+
+        if sentence_index != sentences.len() {
+            return Err(format!(
+                "extracted {} clips, but transcript contains {} lines",
+                sentence_index,
+                sentences.len()
+            )
+            .into());
+        }
+
+        Ok(sentence_index)
+    }
+}
+
+fn sanitize_filename_part(sentence: &str) -> String {
+    let re = Regex::new(r"[^\w]+").unwrap();
+    re.replace_all(&sentence.to_lowercase(), "_")
+        .trim_matches('_')
+        .to_string()
 }
 
 /// Writes opus frames to a file using a FrameHeader to delimit each frame.

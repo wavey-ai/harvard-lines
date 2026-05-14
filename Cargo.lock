@@ -722,6 +722,7 @@ dependencies = [
 name = "mel_spec"
 version = "0.3.4"
 dependencies = [
+ "cc",
  "image 0.24.9",
  "ndarray",
  "ndarray-npy",
